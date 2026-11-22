@@ -66,8 +66,8 @@ This layer uses `@react-native-community/netinfo` to detect whether the device h
 
 - A module-level Onyx connection to `SESSION` triggers `configureAndSubscribe()` whenever accountID changes
 - The NetInfo listener reads `state.isConnected` and calls `setHasRadio()` internally
-- When `isConnected` is `false` → `setHasRadio(false)` → activates the `noRadioActive` hard stop
-- When `isConnected` returns to `true` → `setHasRadio(true)` → clears the `noRadioActive` hard stop
+- A transition to `isConnected: false` activates the `noRadioActive` hard stop. Repeated `false` observations are ignored so they cannot undo recovery after a server response.
+- An observation of `true` or `null` clears the radio stop. A later transition from either value to `false` starts a new radio stop.
 - Detects: airplane mode, WiFi disabled, no cellular signal
 - Does **not** determine actual server reachability — a device can be connected to WiFi but have no internet
 
@@ -75,8 +75,8 @@ This layer uses `@react-native-community/netinfo` to detect whether the device h
 
 The NetInfo listener tracks `isInternetReachable` transitions in both directions:
 
-- **any non-`false` → `false`** (`true→false`, `null→false`, `undefined→false`) — `api/Ping` failed. Sets the `internetUnreachable` hard stop. Only `false→false` is skipped (already offline). This covers cold start with no internet (`null→false` after the initial indeterminate event), post-recovery resets, and normal online→offline transitions. Without this, an idle user would never see the offline indicator because no API requests are failing.
-- **any non-`true` → `true`** — `api/Ping` succeeded. This counts as a recovery only when there is something to recover from: the app was offline at that moment, or a debug tool just cleared its own hard stop and asked for a recovery (`pendingReachabilityRecovery`). A recovery calls `onReachabilityRestored()`, which clears all hard stops and fires reconnect listeners. Any other confirmation (boot, re-subscription after a reconfigure, a `refresh()` re-emit) is a re-read of a network that never went down and is ignored, so it cannot fire duplicate `openApp()`/`reconnectApp()` calls.
+- **any non-`false` → `false`** (`true→false`, `null→false`, `undefined→false`) — `api/Ping` failed. Sets the `internetUnreachable` hard stop. Repeated `false` reports are skipped because a server response may already have cleared the stop. This covers cold start with no internet (`null→false` after the initial indeterminate event), post-recovery resets, and normal online→offline transitions. Without this, an idle user would never see the offline indicator because no API requests are failing.
+- **any non-`true` → `true`** — `api/Ping` succeeded. This counts as a recovery only when there is something to recover from: the app was offline at that moment, or a debug tool just cleared its own hard stop and asked for a recovery (`pendingReachabilityRecovery`). A recovery calls `onReachabilityRestored()`, which clears the connectivity stops and fires reconnect listeners. Any other confirmation (boot, re-subscription after a reconfigure, a `refresh()` re-emit) is a re-read of a network that never went down and is ignored, so it cannot fire duplicate `openApp()`/`reconnectApp()` calls.
 
 **Platform behavior:**
 
@@ -150,10 +150,9 @@ const offline = !hasRadio || internetUnreachable || sustainedFailuresActive || s
 
 ### Recovery flow
 
-`onReachabilityRestored()`:
-1. Sets `hasRadio = true` and `sustainedFailuresActive = false`, resets FailureTracker counters
-2. Calls `updateState()` (which notifies subscribers and clears the hard stop)
-3. Calls `notifyReconnectListeners()` — `Reconnect.ts` subscribes to this and triggers app data sync
+When NetInfo confirms reachability or `FailureTracking` records a successful request during a radio or reachability stop, `clearHardStops()` restores the radio flag, clears reachability and sustained failure stops, and resets the failure counters before notifying subscribers. NetInfo recovery notifies the reconnect listeners immediately. Successful-request recovery uses the existing reconnect jitter for the data sync.
+
+The last raw NetInfo observations remain in place after an API response. That lets `NetworkState` ignore repeated disconnected or unreachable reports while still accepting a later change. Debug offline options and independent queue pauses stay in effect until their owners clear them.
 
 ### App foreground handling
 

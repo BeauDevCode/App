@@ -22,6 +22,7 @@ let lastOfflineAt: string | undefined;
 // NetInfo state
 let accountID: number | undefined;
 let unsubscribeNetInfo: (() => void) | null = null;
+let prevIsConnected: boolean | null | undefined;
 let prevIsInternetReachable: boolean | null | undefined;
 let isPoorConnectionSimulated: boolean | undefined;
 let networkTimeSkew = 0;
@@ -32,20 +33,20 @@ let configuredReachabilityUrl: string | undefined;
 const listeners = new Set<() => void>();
 const reconnectListeners = new Set<() => void>();
 
-// Wire FailureTracker → NetworkState so sustained failures trigger offline state and a
-// successful request clears the INTERNET_UNREACHABLE hard stop. Without the latter only
-// the Ping could clear it. Reads and side-effect commands bypass the paused queue, so the
-// app could keep succeeding at real requests while staying stuck offline.
 onSustainedFailureChange((active) => setSustainedFailures(active));
-// A server response proves the network works, same as a passing Ping.
-// prevIsInternetReachable stays false on purpose: the Ping may keep failing, and a repeated
-// false does not re-set the hard stop. When the Ping finally passes, the NetInfo listener
-// sees the app is already online and does nothing.
+
+// Reads and side-effect commands can receive responses while writes are queued.
+// Use those responses to recover even if NetInfo keeps reporting a disconnect or a failed Ping.
 onRequestSuccess(() => {
-    if (!internetUnreachable) {
+    if (hasRadio && !internetUnreachable) {
         return;
     }
-    Log.info('[NetworkState] INTERNET_UNREACHABLE cleared — a successful request proved connectivity');
+    if (!hasRadio) {
+        Log.info('[NetworkState] NO_RADIO cleared — a successful request proved connectivity');
+    }
+    if (internetUnreachable) {
+        Log.info('[NetworkState] INTERNET_UNREACHABLE cleared — a successful request proved connectivity');
+    }
     clearHardStops();
     scheduleJitteredReconnect();
 });
@@ -177,6 +178,7 @@ function scheduleJitteredReconnect() {
 }
 
 function clearHardStops() {
+    hasRadio = true;
     internetUnreachable = false;
     sustainedFailuresActive = false;
     resetFailureCounters();
@@ -235,7 +237,6 @@ function setFailAllRequests(failAll: boolean) {
  */
 function onReachabilityRestored() {
     Log.info('[NetworkState] Internet reachability restored — clearing hard stops');
-    hasRadio = true;
     clearHardStops();
 
     // Notify reconnect listeners (Reconnect.ts will handle app data sync)
@@ -364,17 +365,19 @@ function configureAndSubscribe() {
     }
 
     unsubscribeNetInfo = NetInfo.addEventListener((state) => {
-        const radio = state.isConnected !== false;
         Log.info(`[NetworkState] NetInfo state change: isConnected=${state.isConnected}, isInternetReachable=${state.isInternetReachable}, type=${state.type}`);
 
-        // Always track real radio/reachability state so values are never stale
-        // when shouldForceOffline is turned off. Only gate the reconnect side effect.
-        setHasRadio(radio);
+        // A request can recover connectivity before NetInfo sees the radio return.
+        // Keep the raw observation so a repeated disconnect cannot undo that recovery.
+        if (state.isConnected !== false || prevIsConnected !== false) {
+            setHasRadio(state.isConnected !== false);
+        }
+        prevIsConnected = state.isConnected;
 
         // When isInternetReachable transitions to false, api/Ping failed — go offline.
         // Fire on any non-false→false transition (true→false, null→false, undefined→false)
         // to catch cold start with no internet and post-recovery resets where prev is null.
-        // Only skip false→false (redundant, already offline).
+        // Skip repeated false reports because a server response may have already cleared this stop.
         if (state.isInternetReachable === false && prevIsInternetReachable !== false) {
             setInternetUnreachable(true);
         }

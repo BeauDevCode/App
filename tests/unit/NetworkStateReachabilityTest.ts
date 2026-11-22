@@ -4,7 +4,7 @@ import type Middleware from '@src/libs/Middleware/types';
 import type * as NetworkState from '@src/libs/NetworkState';
 import type Request from '@src/types/onyx/Request';
 
-import type {NetInfoState, NetInfoWifiState} from '@react-native-community/netinfo';
+import type {NetInfoState, NetInfoUnknownState, NetInfoWifiState} from '@react-native-community/netinfo';
 import type {OnyxKey} from 'react-native-onyx';
 
 import {NetInfoStateType} from '@react-native-community/netinfo';
@@ -13,7 +13,7 @@ let netInfoListener: ((state: NetInfoState) => void) | null = null;
 const mockOnyxCallbacks = new Map<string, (value: unknown) => void>();
 
 jest.mock('@react-native-community/netinfo', () => ({
-    NetInfoStateType: {wifi: 'wifi'},
+    NetInfoStateType: {wifi: 'wifi', unknown: 'unknown'},
     addEventListener: jest.fn((cb: (state: NetInfoState) => void) => {
         netInfoListener = cb;
         return () => {
@@ -32,9 +32,13 @@ jest.mock('react-native-onyx', () => ({
     }),
 }));
 
-function fireNetInfoState(overrides: Partial<NetInfoWifiState>) {
+function fireNetInfoState(overrides: Partial<NetInfoWifiState> | NetInfoUnknownState) {
     if (!netInfoListener) {
         throw new Error('NetInfo listener not registered');
+    }
+    if (overrides.type === NetInfoStateType.unknown) {
+        netInfoListener(overrides);
+        return;
     }
     netInfoListener({
         isConnected: true,
@@ -290,11 +294,13 @@ describe('NetworkState — reachability recovery triggers reconnect', () => {
     });
 });
 
-describe('NetworkState — a successful request clears the INTERNET_UNREACHABLE hard stop', () => {
+describe('NetworkState — a successful request clears connectivity hard stops', () => {
     const mockRequest: Request<OnyxKey> = {command: 'MockCommand'};
     let getIsOffline: typeof NetworkState.getIsOffline;
     let onReachabilityConfirmed: typeof NetworkState.onReachabilityConfirmed;
     let subscribe: typeof NetworkState.subscribe;
+    let setForceOffline: typeof NetworkState.setForceOffline;
+    let simulatePoorConnection: typeof NetworkState.simulatePoorConnection;
     let FailureTracking: Middleware;
 
     beforeEach(() => {
@@ -308,11 +314,97 @@ describe('NetworkState — a successful request clears the INTERNET_UNREACHABLE 
         getIsOffline = mod.getIsOffline;
         onReachabilityConfirmed = mod.onReachabilityConfirmed;
         subscribe = mod.subscribe;
+        setForceOffline = mod.setForceOffline;
+        simulatePoorConnection = mod.simulatePoorConnection;
         FailureTracking = require<{default: Middleware}>('@src/libs/Middleware/FailureTracking').default;
     });
 
     afterEach(() => {
+        jest.restoreAllMocks();
         jest.useRealTimers();
+    });
+
+    test('a response clears NO_RADIO when NetInfo misses the online event', async () => {
+        // Given the radio is reported disconnected while reachability is unknown
+        jest.useFakeTimers();
+        const reconnectListener = jest.fn();
+        onReachabilityConfirmed(reconnectListener);
+        fireNetInfoState({isConnected: false, isInternetReachable: null});
+        expect(getIsOffline()).toBe(true);
+        const offlineStates: boolean[] = [];
+        subscribe(() => offlineStates.push(getIsOffline()));
+
+        // When requests receive responses before any further NetInfo events
+        await FailureTracking(Promise.resolve({jsonCode: 200}), mockRequest, false);
+        await FailureTracking(Promise.resolve({jsonCode: 200}), mockRequest, false);
+
+        // Then subscribers see one recovery and app data sync still uses reconnect jitter
+        expect(getIsOffline()).toBe(false);
+        expect(offlineStates).toEqual([false]);
+        expect(reconnectListener).not.toHaveBeenCalled();
+        jest.runAllTimers();
+        expect(reconnectListener).toHaveBeenCalledTimes(1);
+    });
+
+    test('stale disconnected reports do not undo recovery, and a later disconnect goes offline', async () => {
+        // Given a server response recovered the app before NetInfo reported the radio was back
+        jest.useFakeTimers();
+        fireNetInfoState({isConnected: false, isInternetReachable: null});
+        await FailureTracking(Promise.resolve({jsonCode: 200}), mockRequest, false);
+        expect(getIsOffline()).toBe(false);
+        const stateListener = jest.fn();
+        subscribe(stateListener);
+
+        // When NetInfo repeats the same disconnected report
+        fireNetInfoState({isConnected: false, isInternetReachable: null});
+        fireNetInfoState({isConnected: false, isInternetReachable: null});
+
+        // Then it does not trigger another offline transition
+        expect(getIsOffline()).toBe(false);
+        expect(stateListener).not.toHaveBeenCalled();
+
+        // When NetInfo subsequently sees the radio return and disconnect again
+        fireNetInfoState({isConnected: true, isInternetReachable: null});
+        fireNetInfoState({isConnected: false, isInternetReachable: null});
+
+        // Then this new disconnect puts the app offline
+        expect(getIsOffline()).toBe(true);
+        expect(stateListener).toHaveBeenCalledTimes(1);
+    });
+
+    test('an unknown radio observation preserves the normal nullable behavior', () => {
+        // Given the radio was reported disconnected without a reachability result
+        fireNetInfoState({isConnected: false, isInternetReachable: null});
+        expect(getIsOffline()).toBe(true);
+
+        // When NetInfo loses track of the radio
+        fireNetInfoState({type: NetInfoStateType.unknown, isConnected: null, isInternetReachable: null, details: null});
+
+        // Then unknown radio status alone does not keep the app offline
+        expect(getIsOffline()).toBe(false);
+
+        // When the next observation confirms a disconnect
+        fireNetInfoState({isConnected: false, isInternetReachable: null});
+
+        // Then the disconnect puts the app offline again
+        expect(getIsOffline()).toBe(true);
+    });
+
+    test.each(['force offline', 'simulation'])('a response preserves the %s debug stop', async (debugMode) => {
+        // Given the radio stops and a debug option independently keeps the app offline
+        jest.useFakeTimers();
+        jest.spyOn(Math, 'random').mockReturnValue(0);
+        fireNetInfoState({isConnected: false, isInternetReachable: null});
+        const setDebugOffline = debugMode === 'force offline' ? setForceOffline : simulatePoorConnection;
+        setDebugOffline(true);
+
+        // When the server responds, connectivity recovery cannot end the debug session
+        await FailureTracking(Promise.resolve({jsonCode: 200}), mockRequest, false);
+
+        // Then only disabling the debug option brings the app online
+        expect(getIsOffline()).toBe(true);
+        setDebugOffline(false);
+        expect(getIsOffline()).toBe(false);
     });
 
     test('success while INTERNET_UNREACHABLE is set clears the hard stop and fires reconnect once (jittered)', async () => {
@@ -375,13 +467,13 @@ describe('NetworkState — a successful request clears the INTERNET_UNREACHABLE 
         expect(reconnectListener).toHaveBeenCalledTimes(1);
     });
 
-    test('success while BOTH hard stops are set clears both and fires reconnect exactly once', async () => {
+    test.each([true, false])('one response clears simultaneous connectivity stops with isConnected=%s', async (isConnected) => {
+        // Given a failed Ping and sustained request failures, with or without loss of the radio
         jest.useFakeTimers();
         const reconnectListener = jest.fn();
         onReachabilityConfirmed(reconnectListener);
 
-        // Ping fails and sets the INTERNET_UNREACHABLE hard stop
-        fireNetInfoState({isInternetReachable: false});
+        fireNetInfoState({isConnected, isInternetReachable: false});
         expect(getIsOffline()).toBe(true);
 
         // Requests fail past both thresholds, adding the SUSTAINED_FAILURES hard stop on top
@@ -393,11 +485,15 @@ describe('NetworkState — a successful request clears the INTERNET_UNREACHABLE 
         await expect(FailureTracking(Promise.reject(connectivityError), mockRequest, false)).rejects.toThrow();
         expect(getIsOffline()).toBe(true);
 
-        // One success clears both stops. The success listener resets the failure counters
-        // before recordSuccess reaches its early return, so the sustained-failure path
-        // must not schedule a second reconnect.
+        const offlineStates: boolean[] = [];
+        subscribe(() => offlineStates.push(getIsOffline()));
+
+        // When one request receives a server response before NetInfo reports a recovery
         await FailureTracking(Promise.resolve({jsonCode: 200}), mockRequest, false);
+
+        // Then subscribers see a single recovery and the failure tracker does not schedule a second reconnect
         expect(getIsOffline()).toBe(false);
+        expect(offlineStates).toEqual([false]);
         jest.runAllTimers();
         expect(reconnectListener).toHaveBeenCalledTimes(1);
     });
